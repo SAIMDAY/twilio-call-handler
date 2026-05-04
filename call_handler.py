@@ -6,19 +6,19 @@ import requests
 
 # ====================== CONFIG ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("GMAIL_CHAT_ID")          # Rename this env var if it's not Gmail-related
+CHAT_ID = os.getenv("GMAIL_CHAT_ID")
 LETTA_API_KEY = os.getenv("LETTA_API_KEY")
 AGENT_ID = os.getenv("AGENT_ID")
 LETTA_API_BASE_URL = os.getenv("LETTA_API_BASE_URL", "https://api.letta.com")
 
-# Callback URLs (highly recommended to use env vars in production)
+# Callback URLs (Updated with your Render app)
 TRANSCRIBE_CALLBACK = os.getenv(
-    "TRANSCRIBE_CALLBACK", 
-    "https://YOUR-RENDER-APP.onrender.com/transcription"
+    "TRANSCRIBE_CALLBACK",
+    "https://twilio-call-handler-6qb7.onrender.com/transcription"
 )
 RECORDING_STATUS_CALLBACK = os.getenv(
-    "RECORDING_STATUS_CALLBACK", 
-    "https://YOUR-RENDER-APP.onrender.com/recording-status"
+    "RECORDING_STATUS_CALLBACK",
+    "https://twilio-call-handler-6qb7.onrender.com/recording-status"
 )
 
 # ====================== LOGGING ======================
@@ -34,7 +34,7 @@ app = Flask(__name__)
 
 @app.route("/voice", methods=["POST"])
 def voice():
-    """Handle incoming voice call."""
+    """Handle incoming voice call from Twilio."""
     response = VoiceResponse()
     
     response.say("This call may be recorded for quality purposes.", voice="alice")
@@ -92,6 +92,7 @@ def recording_status():
 def send_to_sammie(text: str):
     """Send message to Letta agent and return assistant reply."""
     url = f"{LETTA_API_BASE_URL}/v1/agents/{AGENT_ID}/messages"
+    
     headers = {
         "Authorization": f"Bearer {LETTA_API_KEY}",
         "Content-Type": "application/json"
@@ -126,7 +127,11 @@ def send_telegram(text: str):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
 
     try:
         requests.post(url, json=payload, timeout=10)
