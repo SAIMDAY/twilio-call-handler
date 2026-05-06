@@ -1,17 +1,16 @@
 import os
 import logging
 from flask import Flask, request, Response
-from twilio.twiml.voice_response import VoiceResponse
+from twilio.twiml.voice_response import VoiceResponse, Dial
 import requests
 
 # ====================== CONFIG ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("GMAIL_CHAT_ID")
+CHAT_ID = os.getenv("GMAIL_CHAT_ID")          # Consider renaming env var to TELEGRAM_CHAT_ID
 LETTA_API_KEY = os.getenv("LETTA_API_KEY")
 AGENT_ID = os.getenv("AGENT_ID")
 LETTA_API_BASE_URL = os.getenv("LETTA_API_BASE_URL", "https://api.letta.com")
 
-# Callback URLs (Updated with your Render app)
 TRANSCRIBE_CALLBACK = os.getenv(
     "TRANSCRIBE_CALLBACK",
     "https://twilio-call-handler-6qb7.onrender.com/transcription"
@@ -20,11 +19,12 @@ RECORDING_STATUS_CALLBACK = os.getenv(
     "RECORDING_STATUS_CALLBACK",
     "https://twilio-call-handler-6qb7.onrender.com/recording-status"
 )
+DAVID_CELL = os.getenv("DAVID_CELL", "+18162870606")
 
 # ====================== LOGGING ======================
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
@@ -34,48 +34,52 @@ app = Flask(__name__)
 
 @app.route("/voice", methods=["POST"])
 def voice():
-    """Handle incoming voice call from Twilio."""
+    """Handle incoming voice call and forward to David with recording + transcription."""
     response = VoiceResponse()
-    
-    response.say("This call may be recorded for quality purposes.", voice="alice")
-    
-    response.record(
-        timeout=10,
-        max_length=3600,
+    response.say(
+        "This call may be recorded for quality purposes.",
+        voice="alice"
+    )
+
+    dial = Dial(
+        record="record-from-answer",
+        recording_status_callback=RECORDING_STATUS_CALLBACK,
+        recording_status_callback_event="completed",
         transcribe=True,
         transcribe_callback=TRANSCRIBE_CALLBACK,
-        recording_status_callback=RECORDING_STATUS_CALLBACK,
-        recording_status_callback_event="completed"
     )
-    
+    dial.number(DAVID_CELL)
+
+    response.append(dial)
     return Response(str(response), mimetype="text/xml")
 
 
 @app.route("/transcription", methods=["POST"])
 def transcription():
-    """Handle transcription callback from Twilio."""
+    """Handle Twilio transcription webhook."""
     transcription_text = request.form.get("TranscriptionText", "").strip()
     from_number = request.form.get("From", "Unknown")
     call_sid = request.form.get("CallSid", "")
-    
-    logger.info(f"Transcription received from {from_number} | CallSid: {call_sid}")
 
-    if transcription_text:
-        message = (
-            f"[AUTOMATED CALL TRANSCRIPTION]\n"
-            f"Caller: {from_number}\n"
-            f"Call SID: {call_sid}\n\n"
-            f"Transcription:\n{transcription_text}"
-        )
-        
-        reply = send_to_sammie(message)
-        
-        if reply:
-            send_telegram(f"📞 Call from {from_number}\n\n{reply}")
-        else:
-            send_telegram(f"📞 Call from {from_number}\n\n(No reply from Sammie)")
+    logger.info(f"Transcription received | From: {from_number} | CallSid: {call_sid}")
+
+    if not transcription_text:
+        send_telegram(f"📞 Call from {from_number}\n\n(No transcription available)")
+        return "", 200
+
+    message = (
+        f"[AUTOMATED CALL TRANSCRIPTION]\n"
+        f"Caller: {from_number}\n"
+        f"Call SID: {call_sid}\n\n"
+        f"Transcription:\n{transcription_text}"
+    )
+
+    reply = send_to_sammie(message)
+
+    if reply:
+        send_telegram(f"📞 Call from {from_number}\n\n{reply}")
     else:
-        send_telegram(f"📞 Call from {from_number} - No transcription available")
+        send_telegram(f"📞 Call from {from_number}\n\n(No reply from Sammie)")
 
     return "", 200
 
@@ -89,13 +93,12 @@ def recording_status():
     return "", 200
 
 
-def send_to_sammie(text: str):
-    """Send message to Letta agent and return assistant reply."""
+def send_to_sammie(text: str) -> str | None:
+    """Send message to Letta agent and return assistant's reply."""
     url = f"{LETTA_API_BASE_URL}/v1/agents/{AGENT_ID}/messages"
-    
     headers = {
         "Authorization": f"Bearer {LETTA_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
     payload = {"input": text}
 
@@ -127,11 +130,7 @@ def send_telegram(text: str):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
+    payload = {"chat_id": CHAT_ID, "text": text}
 
     try:
         requests.post(url, json=payload, timeout=10)
