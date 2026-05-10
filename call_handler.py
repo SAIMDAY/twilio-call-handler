@@ -1,25 +1,26 @@
 import os
+import json
 import logging
+from collections import defaultdict
 from flask import Flask, request, Response
-from twilio.twiml.voice_response import VoiceResponse, Dial
+from twilio.twiml.voice_response import VoiceResponse, Dial, Start
 import requests
 
 # ====================== CONFIG ======================
+DAVID_CELL = os.getenv("DAVID_CELL", "+19752083042")
+TRANSCRIPTION_CALLBACK = os.getenv(
+    "TRANSCRIPTION_CALLBACK",
+    "https://twilio.sammieai.org/transcription"
+)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("GMAIL_CHAT_ID")          # Consider renaming env var to TELEGRAM_CHAT_ID
+CHAT_ID = os.getenv("GMAIL_CHAT_ID")
 LETTA_API_KEY = os.getenv("LETTA_API_KEY")
 AGENT_ID = os.getenv("AGENT_ID")
 LETTA_API_BASE_URL = os.getenv("LETTA_API_BASE_URL", "https://api.letta.com")
 
-TRANSCRIBE_CALLBACK = os.getenv(
-    "TRANSCRIBE_CALLBACK",
-    "https://twilio-call-handler-6qb7.onrender.com/transcription"
-)
-RECORDING_STATUS_CALLBACK = os.getenv(
-    "RECORDING_STATUS_CALLBACK",
-    "https://twilio-call-handler-6qb7.onrender.com/recording-status"
-)
-DAVID_CELL = os.getenv("DAVID_CELL", "+18162870606")
+# ====================== STATE ======================
+transcription_state = defaultdict(lambda: {"inbound_track": [], "outbound_track": []})
+caller_numbers = {}
 
 # ====================== LOGGING ======================
 logging.basicConfig(
@@ -34,67 +35,106 @@ app = Flask(__name__)
 
 @app.route("/voice", methods=["POST"])
 def voice():
-    """Handle incoming voice call and forward to David with recording + transcription."""
+    """Handle incoming call: forward to David with caller ID passthrough + real-time transcription."""
+    from_number = request.form.get("From", "Unknown")
+    call_sid = request.form.get("CallSid", "")
+
+    caller_numbers[call_sid] = from_number
+
     response = VoiceResponse()
-    response.say(
-        "This call may be recorded for quality purposes.",
-        voice="alice"
-    )
 
-    dial = Dial(
-        record="record-from-answer",
-        recording_status_callback=RECORDING_STATUS_CALLBACK,
-        recording_status_callback_event="completed",
-        transcribe=True,
-        transcribe_callback=TRANSCRIBE_CALLBACK,
+    # Start real-time transcription using TwiML
+    start = Start()
+    start.transcription(
+        status_callback_url=TRANSCRIPTION_CALLBACK,
+        track="both_tracks",
+        inbound_track_label="caller",
+        outbound_track_label="david",
+        language_code="en-US",
+        partial_results=False,
     )
+    response.append(start)
+
+    # Forward call to David's eSIM with caller ID passthrough
+    dial = Dial(caller_id=from_number)
     dial.number(DAVID_CELL)
-
     response.append(dial)
+
     return Response(str(response), mimetype="text/xml")
 
 
 @app.route("/transcription", methods=["POST"])
 def transcription():
-    """Handle Twilio transcription webhook."""
-    transcription_text = request.form.get("TranscriptionText", "").strip()
-    from_number = request.form.get("From", "Unknown")
-    call_sid = request.form.get("CallSid", "")
+    """Handle real-time transcription events from Twilio."""
+    data = request.get_json(silent=True) or {}
+    event = data.get("TranscriptionEvent", "")
+    call_sid = data.get("CallSid", "")
 
-    logger.info(f"Transcription received | From: {from_number} | CallSid: {call_sid}")
+    if event == "transcription-started":
+        logger.info(f"Transcription started for call {call_sid}")
 
-    if not transcription_text:
-        send_telegram(f"📞 Call from {from_number}\n\n(No transcription available)")
-        return "", 200
+    elif event == "transcription-content":
+        track = data.get("Track", "")
+        transcription_data_raw = data.get("TranscriptionData", "")
+        is_final = data.get("Final", "false") == "true"
 
-    message = (
-        f"[AUTOMATED CALL TRANSCRIPTION]\n"
-        f"Caller: {from_number}\n"
-        f"Call SID: {call_sid}\n\n"
-        f"Transcription:\n{transcription_text}"
-    )
+        try:
+            trans_data = json.loads(transcription_data_raw) if transcription_data_raw else {}
+            transcript = trans_data.get("transcript", "").strip()
+        except json.JSONDecodeError:
+            transcript = transcription_data_raw
 
-    reply = send_to_sammie(message)
+        if transcript and is_final:
+            transcription_state[call_sid][track].append(transcript)
+            logger.info(f"[{call_sid}] {track}: {transcript}")
 
-    if reply:
-        send_telegram(f"📞 Call from {from_number}\n\n{reply}")
-    else:
-        send_telegram(f"📞 Call from {from_number}\n\n(No reply from Sammie)")
+    elif event == "transcription-stopped":
+        segments = transcription_state.pop(call_sid, {"inbound_track": [], "outbound_track": []})
+        caller_number = caller_numbers.pop(call_sid, "Unknown")
+
+        caller_text = " ".join(segments.get("inbound_track", [])).strip()
+        david_text = " ".join(segments.get("outbound_track", [])).strip()
+
+        if not caller_text and not david_text:
+            send_telegram(f"📞 Call from {caller_number}\n\n(No transcription available)")
+            return "", 200
+
+        parts = []
+        if caller_text:
+            parts.append(f"Caller: {caller_text}")
+        if david_text:
+            parts.append(f"David: {david_text}")
+
+        full_transcription = "\n\n".join(parts)
+
+        message = (
+            f"[CALL TRANSCRIPTION]\n"
+            f"From: {caller_number}\n\n"
+            f"{full_transcription}"
+        )
+
+        reply = send_to_sammie(message)
+        if reply:
+            send_telegram(f"📞 Call from {caller_number}\n\n{reply}")
+        else:
+            send_telegram(f"📞 Call from {caller_number}\n\n(No reply from Sammie)")
+
+    elif event == "transcription-error":
+        error_code = data.get("TranscriptionErrorCode", "")
+        error_msg = data.get("TranscriptionError", "")
+        logger.error(f"Transcription error for call {call_sid}: {error_code} - {error_msg}")
 
     return "", 200
 
 
-@app.route("/recording-status", methods=["POST"])
-def recording_status():
-    """Handle recording status callback."""
-    status = request.form.get("RecordingStatus", "")
-    call_sid = request.form.get("CallSid", "")
-    logger.info(f"Recording status - CallSid: {call_sid} | Status: {status}")
-    return "", 200
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check endpoint."""
+    return {"status": "ok"}, 200
 
 
 def send_to_sammie(text: str) -> str | None:
-    """Send message to Letta agent and return assistant's reply."""
+    """Send message to Sammie and return assistant's reply."""
     url = f"{LETTA_API_BASE_URL}/v1/agents/{AGENT_ID}/messages"
     headers = {
         "Authorization": f"Bearer {LETTA_API_KEY}",
@@ -104,7 +144,6 @@ def send_to_sammie(text: str) -> str | None:
 
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=60)
-        
         if resp.status_code == 200:
             data = resp.json()
             reply = ""
@@ -117,7 +156,6 @@ def send_to_sammie(text: str) -> str | None:
         else:
             logger.error(f"Letta API error {resp.status_code}: {resp.text}")
             return None
-
     except Exception as e:
         logger.error(f"Failed to communicate with Letta: {e}")
         return None
