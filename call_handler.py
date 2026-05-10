@@ -1,14 +1,13 @@
 import os
 import json
 import logging
-from collections import defaultdict
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse, Dial, Start
 from twilio.rest import Client
 import requests as http_requests
 
 DAVID_CELL = os.getenv("DAVID_CELL", "+19752083042")
-TRANSCRIPTION_CALLBACK = os.getenv("TRANSCRIPTION_CALLBACK", "https://twilio.sammieai.org/transcription")
+TRANSCRIPTION_CALLBACK_BASE = os.getenv("TRANSCRIPTION_CALLBACK", "https://twilio.sammieai.org/transcription")
 STATUS_CALLBACK = os.getenv("STATUS_CALLBACK", "https://twilio.sammieai.org/status")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("GMAIL_CHAT_ID")
@@ -18,8 +17,7 @@ LETTA_API_BASE_URL = os.getenv("LETTA_API_BASE_URL", "https://api.letta.com")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
-transcription_state = defaultdict(lambda: {"inbound_track": [], "outbound_track": []})
-caller_numbers = {}
+transcription_state = {}
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,14 +29,16 @@ app = Flask(__name__)
 def voice():
     from_number = request.form.get("From", "Unknown")
     call_sid = request.form.get("CallSid", "")
-    caller_numbers[call_sid] = from_number
     logger.info(f"Incoming call from {from_number} (SID: {call_sid})")
+
+    # Pass caller number in callback URL so transcription has it
+    transcription_callback = f"{TRANSCRIPTION_CALLBACK_BASE}?caller={from_number}"
 
     response = VoiceResponse()
 
     start = Start()
     start.transcription(
-        status_callback_url=TRANSCRIPTION_CALLBACK,
+        status_callback_url=transcription_callback,
         track="both_tracks",
         inbound_track_label="caller",
         outbound_track_label="david",
@@ -74,7 +74,7 @@ def status():
         try:
             client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
             t = client.calls(target_sid).transcriptions.create(
-                status_callback_url=TRANSCRIPTION_CALLBACK,
+                status_callback_url=f"{TRANSCRIPTION_CALLBACK_BASE}?caller=unknown",
                 track="both_tracks",
                 inbound_track_label="caller",
                 outbound_track_label="david",
@@ -90,10 +90,12 @@ def status():
 
 @app.route("/transcription", methods=["GET", "POST", "PUT"])
 def transcription():
-    # DEBUG: Log ALL incoming requests
-    logger.info(f"/transcription HIT - Method: {request.method}")
+    # Get caller number from query param (passed in callback URL)
+    caller_number = request.args.get("caller", "Unknown")
+    
+    logger.info(f"/transcription HIT - caller: {caller_number}")
     logger.info(f"/transcription Content-Type: {request.content_type}")
-    logger.info(f"/transcription Raw body: {request.get_data(as_text=True)[:2000]}")
+    logger.info(f"/transcription Raw body: {request.get_data(as_text=True)[:500]}")
 
     data = request.get_json(silent=True) or {}
     if not data:
@@ -107,6 +109,7 @@ def transcription():
 
     if event == "transcription-started":
         logger.info(f"Transcription started for call {call_sid} (SID: {data.get('TranscriptionSid', '')})")
+        transcription_state[call_sid] = {"caller": [], "david": [], "caller_number": caller_number}
 
     elif event == "transcription-content":
         track = data.get("Track", "")
@@ -119,19 +122,25 @@ def transcription():
             transcript = raw
 
         if transcript and is_final:
-            transcription_state[call_sid][track].append(transcript)
-            logger.info(f"[{call_sid}] {track}: {transcript}")
+            # Initialize if not exists (in case we missed the started event)
+            if call_sid not in transcription_state:
+                transcription_state[call_sid] = {"caller": [], "david": [], "caller_number": caller_number}
+            
+            track_key = "caller" if "inbound" in track.lower() or track == "caller" else "david"
+            transcription_state[call_sid][track_key].append(transcript)
+            logger.info(f"[{call_sid}] {track_key}: {transcript}")
 
     elif event == "transcription-stopped":
-        segments = transcription_state.pop(call_sid, {"inbound_track": [], "outbound_track": []})
-        caller_number = caller_numbers.pop(call_sid, "Unknown")
-        caller_text = " ".join(segments.get("inbound_track", [])).strip()
-        david_text = " ".join(segments.get("outbound_track", [])).strip()
+        segments = transcription_state.pop(call_sid, {"caller": [], "david": [], "caller_number": caller_number})
+        caller_number = segments.get("caller_number", caller_number)
+        caller_text = " ".join(segments.get("caller", [])).strip()
+        david_text = " ".join(segments.get("david", [])).strip()
 
         if not caller_text and not david_text:
             send_telegram(f"Call from {caller_number} - no transcription available")
             return "", 200
 
+        # Format cleanly for David
         parts = []
         if caller_text:
             parts.append(f"Caller: {caller_text}")
