@@ -43,7 +43,7 @@ def voice():
         inbound_track_label="caller",
         outbound_track_label="david",
         transcription_engine="google",
-        speech_model="telephony",
+        speech_model="default",
         partial_results=False,
     )
     response.append(start)
