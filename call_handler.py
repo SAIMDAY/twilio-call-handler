@@ -33,7 +33,7 @@ def voice():
     caller_numbers[call_sid] = from_number
     logger.info(f"Incoming call from {from_number} (SID: {call_sid})")
     response = VoiceResponse()
-    dial = Dial(caller_id=from_number, status_callback=STATUS_CALLBACK, status_callback_event=["answered", "completed"])
+    dial = Dial(caller_id=from_number, status_callback=STATUS_CALLBACK, status_callback_event="answered completed")
     dial.number(DAVID_CELL)
     response.append(dial)
     return Response(str(response), mimetype="text/xml")
